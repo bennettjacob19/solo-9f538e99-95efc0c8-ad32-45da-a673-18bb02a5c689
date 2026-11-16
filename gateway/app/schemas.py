@@ -32,6 +32,20 @@ class EmbeddingRequest(BaseModel):
         default=None,
         description="Optional model hint forwarded to the backend.",
     )
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description=(
+            "Optional idempotency key (also accepted as the Idempotency-Key "
+            "header). Retrying with the same key and identical input, model "
+            "and timeout_ms shares the in-flight computation or replays its "
+            "stored result instead of sending a duplicate batch to the "
+            "backend. Reusing the key with different parameters is rejected "
+            "with 409 and never queued."
+        ),
+        examples=["search-7f3d2c1e"],
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -54,6 +68,15 @@ class EmbeddingRequest(BaseModel):
             raise ValueError("input must be a string or a list of strings")
         return value
 
+    @field_validator("idempotency_key")
+    @classmethod
+    def _reject_control_characters(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            ord(char) < 32 or ord(char) == 127 for char in value
+        ):
+            raise ValueError("idempotency_key must not contain control characters")
+        return value
+
     def as_texts(self) -> list[str]:
         return [self.input] if isinstance(self.input, str) else list(self.input)
 
@@ -71,6 +94,13 @@ class EmbeddingResponse(BaseModel):
     batch_id: str = Field(description="Identifier shared by one backend batch.")
     batch_size: int = Field(
         description="Total number of texts sent to the backend in this batch."
+    )
+    idempotent_replay: bool = Field(
+        default=False,
+        description=(
+            "True when this response was replayed from a previously completed "
+            "idempotent operation instead of waiting for a live batch."
+        ),
     )
 
 
@@ -90,3 +120,9 @@ class StatsResponse(BaseModel):
     pending_requests: int
     in_flight: bool
     last_batch: dict[str, Any] | None = None
+    idempotent_requests: int = 0
+    idempotent_operations: int = 0
+    idempotent_attached: int = 0
+    idempotent_replayed: int = 0
+    idempotency_conflicts: int = 0
+    idempotency_keys_tracked: int = 0

@@ -169,7 +169,7 @@ class BatchScheduler:
         disconnect_task: asyncio.Task[bool] | None = None
         if request is not None:
             disconnect_task = asyncio.create_task(
-                self._watch_disconnect(request), name=f"disconnect-{request_id}"
+                self.watch_disconnect(request), name=f"disconnect-{request_id}"
             )
 
         waiters: set[asyncio.Future[Any]] = {result_task}
@@ -235,12 +235,13 @@ class BatchScheduler:
             elif not item.future.done():
                 item.future.cancel()
 
-    async def _watch_disconnect(self, request: Any) -> bool:
+    async def watch_disconnect(self, request: Any) -> bool:
         """Poll until the client is gone.
 
         Returns ``True`` for an observed disconnect and ``False`` when the
-        server cannot observe disconnects at all, in which case :meth:`submit`
-        stops waiting on this probe.
+        server cannot observe disconnects at all, in which case the caller
+        stops waiting on this probe.  Shared with the idempotency registry,
+        which applies the same per-caller disconnect semantics.
         """
         interval = self.settings.disconnect_poll_interval_ms / 1000.0
         while True:
@@ -526,6 +527,18 @@ class BatchScheduler:
         return BackendError(f"backend batch failed: {exc}")
 
     # --------------------------------------------------------------- status
+    def note_timed_out(self) -> None:
+        """Record a caller-side timeout observed outside the scheduler.
+
+        Used by the idempotency layer, whose HTTP callers wait on a shared
+        operation rather than on a scheduler-owned future.
+        """
+        self._stats["timed_out_requests"] += 1
+
+    def note_disconnected(self) -> None:
+        """Record a caller-side disconnect observed outside the scheduler."""
+        self._stats["disconnected_requests"] += 1
+
     def stats(self) -> dict[str, Any]:
         snapshot = dict(self._stats)
         snapshot["pending_requests"] = sum(

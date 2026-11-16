@@ -41,6 +41,7 @@ class Settings:
     default_timeout_ms: int = 5000
     max_timeout_ms: int = 600_000
     disconnect_poll_interval_ms: int = 20
+    idempotency_max_entries: int = 10_000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -78,6 +79,10 @@ class Settings:
                 "GATEWAY_DISCONNECT_POLL_INTERVAL_MS",
                 cls.disconnect_poll_interval_ms,
             ),
+            idempotency_max_entries=_env_int(
+                "GATEWAY_IDEMPOTENCY_MAX_ENTRIES",
+                cls.idempotency_max_entries,
+            ),
         )
 
     def validate(self) -> None:
@@ -97,3 +102,5 @@ class Settings:
             raise ValueError("timeouts must be >= 1 ms")
         if self.default_timeout_ms > self.max_timeout_ms:
             raise ValueError("default_timeout_ms exceeds max_timeout_ms")
+        if self.idempotency_max_entries < 1:
+            raise ValueError("idempotency_max_entries must be >= 1")

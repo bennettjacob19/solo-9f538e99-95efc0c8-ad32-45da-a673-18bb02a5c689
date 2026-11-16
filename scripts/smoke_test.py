@@ -151,6 +151,143 @@ async def main(gateway: str, backend: str) -> int:
         )
         check("timeout_ms=0 rejected", zero_timeout.status_code == 422)
 
+        # 5. Idempotency: concurrent retries share one computation.
+        await client.post(f"{backend}/admin/reset")
+        await client.post(f"{backend}/admin/config", json={"delay_ms": 300, "mode": "ok"})
+        idem_payload = {
+            "input": ["idem-a", "idem-b"],
+            "timeout_ms": 5000,
+            "idempotency_key": "smoke-shared",
+        }
+        concurrent = await asyncio.gather(
+            *[client.post(f"{gateway}/v1/embeddings", json=idem_payload) for _ in range(3)]
+        )
+        check(
+            "concurrent retries all succeed",
+            all(r.status_code == 200 for r in concurrent),
+            str([r.status_code for r in concurrent]),
+        )
+        check(
+            "concurrent retries share one batch",
+            len({r.json()["batch_id"] for r in concurrent}) == 1,
+        )
+        bstats = (await client.get(f"{backend}/admin/stats")).json()
+        check(
+            "backend ran the computation once",
+            bstats["total_requests"] == 1,
+            f"total_requests={bstats['total_requests']}",
+        )
+
+        # 5b. Replay: identical retry is served from the stored result.
+        replay = await client.post(f"{gateway}/v1/embeddings", json=idem_payload)
+        check("replay succeeds", replay.status_code == 200, replay.text)
+        check(
+            "replay flagged and matches original batch",
+            replay.json()["idempotent_replay"] is True
+            and replay.json()["batch_id"] == concurrent[0].json()["batch_id"],
+            replay.text,
+        )
+        bstats = (await client.get(f"{backend}/admin/stats")).json()
+        check("replay did not hit the backend", bstats["total_requests"] == 1)
+
+        # 5c. Conflict: same key, different parameters -> 409, not queued.
+        conflict = await client.post(
+            f"{gateway}/v1/embeddings",
+            json={
+                "input": ["idem-different"],
+                "timeout_ms": 5000,
+                "idempotency_key": "smoke-shared",
+            },
+        )
+        check(
+            "same key with different input returns 409",
+            conflict.status_code == 409
+            and conflict.json()["error"]["code"] == "idempotency_conflict",
+            f"{conflict.status_code} {conflict.text}",
+        )
+        bstats = (await client.get(f"{backend}/admin/stats")).json()
+        check("conflict was never queued", bstats["total_requests"] == 1)
+
+        # 5d. Header transport: Idempotency-Key header shares the namespace.
+        via_header = await client.post(
+            f"{gateway}/v1/embeddings",
+            json={"input": ["idem-a", "idem-b"], "timeout_ms": 5000},
+            headers={"Idempotency-Key": "smoke-shared"},
+        )
+        check(
+            "header key replays the same stored result",
+            via_header.status_code == 200
+            and via_header.json()["idempotent_replay"] is True,
+            via_header.text,
+        )
+
+        # 5e. Timeout then retry: the late result is collected by the retry.
+        await client.post(f"{backend}/admin/config", json={"delay_ms": 300, "mode": "ok"})
+        timed = {
+            "input": ["idem-slow"],
+            "timeout_ms": 200,
+            "idempotency_key": "smoke-timeout",
+        }
+        first = await client.post(f"{gateway}/v1/embeddings", json=timed)
+        check("first caller times out with 504", first.status_code == 504, first.text)
+        retry = await client.post(f"{gateway}/v1/embeddings", json=timed)
+        check(
+            "retry collects the late result of the original batch",
+            retry.status_code == 200,
+            retry.text,
+        )
+        bstats = (await client.get(f"{backend}/admin/stats")).json()
+        check(
+            "timed-out computation still ran only once",
+            bstats["total_requests"] == 2,
+            f"total_requests={bstats['total_requests']}",
+        )
+
+        # 5f. Failure recovery: a failed operation releases its key.
+        await client.post(f"{backend}/admin/config", json={"delay_ms": 50, "mode": "error"})
+        failing = {
+            "input": ["idem-flaky"],
+            "timeout_ms": 5000,
+            "idempotency_key": "smoke-failure",
+        }
+        failed = await client.post(f"{gateway}/v1/embeddings", json=failing)
+        check("backend failure returns 502", failed.status_code == 502, failed.text)
+        await client.post(f"{backend}/admin/config", json={"mode": "ok"})
+        recovered = await client.post(f"{gateway}/v1/embeddings", json=failing)
+        check(
+            "same key retries successfully after failure",
+            recovered.status_code == 200 and recovered.json()["idempotent_replay"] is False,
+            recovered.text,
+        )
+
+        gstats = (await client.get(f"{gateway}/stats")).json()
+        check(
+            "idempotency counters exposed in /stats",
+            gstats["idempotent_operations"] >= 3
+            and gstats["idempotent_replayed"] >= 2
+            and gstats["idempotency_conflicts"] == 1,
+            json.dumps({k: v for k, v in gstats.items() if k.startswith("idem")}),
+        )
+        check(
+            "no stuck requests after idempotency scenarios",
+            gstats["pending_requests"] == 0 and not gstats["in_flight"],
+        )
+        bstats = (await client.get(f"{backend}/admin/stats")).json()
+        check(
+            "single-slot backend still never overlapped",
+            bstats["max_concurrency"] == 1 and bstats["concurrency_violations"] == 0,
+            f"max={bstats['max_concurrency']}",
+        )
+
+        # 5g. The idempotency API is documented in the interactive docs.
+        openapi = await client.get(f"{gateway}/openapi.json")
+        check(
+            "openapi documents Idempotency-Key header and body field",
+            openapi.status_code == 200
+            and "Idempotency-Key" in openapi.text
+            and "idempotency_key" in openapi.text,
+        )
+
     print()
     print("RESULT:", "ALL CHECKS PASSED" if failures == 0 else f"{failures} FAILURE(S)")
     return 0 if failures == 0 else 1

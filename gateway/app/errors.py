@@ -42,6 +42,17 @@ class ServiceUnavailable(GatewayError):
     code = "service_unavailable"
 
 
+class IdempotencyConflict(GatewayError):
+    """The idempotency key was already used with different parameters.
+
+    Raised before any queueing happens: a conflicting request must never
+    reach the batching pipeline.
+    """
+
+    status_code = 409
+    code = "idempotency_conflict"
+
+
 class ValidationError(GatewayError):
     """The request is well-formed JSON but violates gateway limits."""
 
